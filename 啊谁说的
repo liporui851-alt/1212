@@ -1,0 +1,944 @@
+-- AGENT v7 | 预加载等 WindUI 完成 + 完整工具提示词
+local Players = game:GetService('Players')
+local Lighting = game:GetService('Lighting')
+local TweenService = game:GetService('TweenService')
+local HttpService = game:GetService('HttpService')
+local player = Players.LocalPlayer
+local pg = player:WaitForChild('PlayerGui')
+
+-- ========== 头像异步获取 ==========
+local avatarUrl = ''
+local avatarReady = false
+task.spawn(function()
+    for i = 1, 40 do
+        local ok, url = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size150x150)
+        end)
+        if ok and url and url ~= '' and not tostring(url):find('id=0') then
+            avatarUrl = url
+            avatarReady = true
+            return
+        end
+        task.wait(0.1)
+    end
+    avatarUrl = 'https://www.roblox.com/headshot-thumbnail/image?userId=' .. player.UserId .. '&width=150&height=150&format=png'
+    avatarReady = true
+end)
+
+-- ========== CONFIG ==========
+local CONFIG_FILE = 'AgentWindUI/settings.json'
+local defaults = {
+    language='zh', theme='Dark', transparency=.15, acrylic=false,
+    animations=true, apiKey='', model='deepseek-chat',
+    thinking=true, autoExecute=true
+}
+local cfg = table.clone(defaults)
+local function saveConfig()
+    if type(writefile) ~= 'function' then return false end
+    return pcall(function()
+        if type(makefolder) == 'function' then pcall(makefolder,'AgentWindUI') end
+        writefile(CONFIG_FILE, HttpService:JSONEncode(cfg))
+    end)
+end
+local function loadConfig()
+    if type(readfile) ~= 'function' then return false end
+    local ok, data = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FILE)) end)
+    if ok and type(data) == 'table' then
+        for k, v in pairs(defaults) do
+            if type(data[k]) == type(v) then cfg[k] = data[k] end
+        end
+        return true
+    end
+    return false
+end
+loadConfig()
+cfg.autoExecute = true
+if cfg.model ~= 'deepseek-chat' and cfg.model ~= 'deepseek-reasoner' then
+    cfg.model = 'deepseek-chat'
+end
+
+-- ========== 多语言 ==========
+local LANG = {
+    zh = {
+        agent='AI 智能体', settings='设置', welcome='Agent 已就绪',
+        welcomeDesc='输入 API Key 开始对话', apiKey='API 密钥', model='AI 模型',
+        message='消息', send='发送', newChat='新建会话', appearance='外观美化',
+        language='界面语言', theme='主题', transparency='背景透明度',
+        acrylic='背景模糊', animations='动画偏好', thinking='思考动画',
+        autoExec='自动执行代码', save='保存设置', load='读取设置', reset='恢复默认',
+        needKey='请先填写 API Key', apiError='API 错误', chat='对话', empty='暂无消息'
+    },
+    ja = {
+        agent='AI エージェント', settings='設定', welcome='Agent の準備完了',
+        welcomeDesc='API キーを入力してください', apiKey='API キー', model='AI モデル',
+        message='メッセージ', send='送信', newChat='新しいチャット', appearance='外観',
+        language='言語', theme='テーマ', transparency='透明度', acrylic='背景ぼかし',
+        animations='アニメーション設定', thinking='思考アニメ', autoExec='コード自動実行',
+        save='保存', load='読み込み', reset='リセット', needKey='API キーを入力してください',
+        apiError='API エラー', chat='チャット', empty='メッセージなし'
+    },
+    en = {
+        agent='AI Agent', settings='Settings', welcome='Agent ready',
+        welcomeDesc='Enter API key to start', apiKey='API Key', model='AI Model',
+        message='Message', send='Send', newChat='New Chat', appearance='Appearance',
+        language='Language', theme='Theme', transparency='Transparency',
+        acrylic='Background Blur', animations='Animation preference',
+        thinking='Thinking Animation', autoExec='Auto Execute Code',
+        save='Save', load='Load', reset='Reset', needKey='Enter an API key first',
+        apiError='API error', chat='Chat', empty='No messages yet'
+    }
+}
+local function tr(k)
+    return (LANG[cfg.language] or LANG.en)[k] or LANG.en[k] or k
+end
+local function notify(ui, msg)
+    pcall(function() ui:Notify({Title='Agent', Content=tostring(msg), Duration=3}) end)
+end
+local function safe(obj, method, ...)
+    if not obj then return end
+    local args = {...}
+    pcall(function()
+        if type(obj[method]) == 'function' then obj[method](obj, table.unpack(args)) end
+    end)
+end
+
+-- ========== 预加载：等 WindUI 加载完才退场 ==========
+-- 先启动 WindUI 加载（后台跑）
+local windUILoaded = false
+local WindUI = nil
+task.spawn(function()
+    local ok, result = pcall(function()
+        local f = (loadstring or load)(game:HttpGet(
+            'https://github.com/Footagesus/WindUI/releases/latest/download/main.lua'
+        ))
+        assert(type(f) == 'function', 'WindUI compile failed')
+        return f()
+    end)
+    if ok and result then
+        WindUI = result
+        windUILoaded = true
+    else
+        warn('[Agent] WindUI 加载失败: ' .. tostring(result))
+        windUILoaded = true  -- 标记完成，让预加载退出（后面会 return）
+    end
+end)
+
+-- 预加载动画
+local preloaderDone = false
+do
+    local t0 = os.clock()
+
+    local old = pg:FindFirstChild('AgentStartupLoader')
+    if old then old:Destroy() end
+    local oldBlur = Lighting:FindFirstChild('AgentStartupBlur')
+    if oldBlur then oldBlur:Destroy() end
+
+    local blur, sg, title, sub, foot, track, fill, avatarImg
+
+    local function anim(o, t, p)
+        local tw = TweenService:Create(o, TweenInfo.new(t, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), p)
+        tw:Play()
+        return tw
+    end
+
+    blur = Instance.new('BlurEffect')
+    blur.Name = 'AgentStartupBlur'
+    blur.Size = 0
+    blur.Parent = Lighting
+
+    sg = Instance.new('ScreenGui')
+    sg.Name = 'AgentStartupLoader'
+    sg.IgnoreGuiInset = true
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 10000
+    sg.Parent = pg
+
+    local function label(text, y, offset, size, font, color)
+        local l = Instance.new('TextLabel')
+        l.AnchorPoint = Vector2.new(.5, .5)
+        l.Position = UDim2.new(.5, 0, y, offset)
+        l.Size = UDim2.new(.95, 0, 0, 25)
+        l.BackgroundTransparency = 1
+        l.Text = text
+        l.TextSize = size
+        l.Font = font
+        l.TextColor3 = color
+        l.TextTransparency = 1
+        l.Parent = sg
+        return l
+    end
+
+    avatarImg = Instance.new('ImageLabel')
+    avatarImg.Name = 'PlayerAvatar'
+    avatarImg.AnchorPoint = Vector2.new(.5, .5)
+    avatarImg.Position = UDim2.new(.5, 0, .485, -45)
+    avatarImg.Size = UDim2.fromOffset(42, 42)
+    avatarImg.BackgroundTransparency = 1
+    avatarImg.Image = ''
+    avatarImg.ImageTransparency = 1
+    avatarImg.Parent = sg
+    Instance.new('UICorner', avatarImg).CornerRadius = UDim.new(1, 0)
+
+    task.spawn(function()
+        local tt = tick()
+        while not avatarReady and tick() - tt < 5 do
+            task.wait(0.05)
+        end
+        if avatarImg and avatarImg.Parent then
+            avatarImg.Image = avatarUrl
+        end
+    end)
+
+    title = label(player.Name, .485, 0, 18, Enum.Font.GothamBold, Color3.new(1, 1, 1))
+    sub = label('Initializing Agent...', .485, 19, 10, Enum.Font.Gotham, Color3.fromRGB(188, 190, 199))
+    foot = label('Loading WindUI...', 1, -24, 9, Enum.Font.Gotham, Color3.fromRGB(220, 222, 230))
+
+    track = Instance.new('Frame')
+    track.AnchorPoint = Vector2.new(.5, .5)
+    track.Position = UDim2.new(.5, 0, .485, 42)
+    track.Size = UDim2.fromOffset(120, 2)
+    track.BackgroundColor3 = Color3.fromRGB(110, 115, 130)
+    track.BackgroundTransparency = .75
+    track.BorderSizePixel = 0
+    track.Parent = sg
+
+    fill = Instance.new('Frame')
+    fill.Size = UDim2.fromScale(0, 1)
+    fill.BackgroundColor3 = Color3.fromRGB(245, 248, 255)
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    Instance.new('UICorner', track).CornerRadius = UDim.new(1, 0)
+    Instance.new('UICorner', fill).CornerRadius = UDim.new(1, 0)
+
+    anim(blur, .3, {Size = 22})
+    for _, l in ipairs({title, sub, foot}) do
+        anim(l, .3, {TextTransparency = 0})
+    end
+    anim(avatarImg, .3, {ImageTransparency = 0})
+
+    -- 进度条慢慢涨，但**只在 WindUI 加载完后**才推到 100%
+    local progress = 0
+    local progressConn
+    progressConn = game:GetService('RunService').Heartbeat:Connect(function(dt)
+        -- 最多涨到 90%，剩下 10% 等 WindUI
+        local target = windUILoaded and 1 or 0.9
+        if progress < target then
+            progress = math.min(target, progress + dt * 0.35)
+            fill.Size = UDim2.fromScale(progress, 1)
+        end
+        if progress >= 1 and windUILoaded then
+            progressConn:Disconnect()
+        end
+    end)
+
+    -- 等 WindUI 加载完 + 最短 1.5 秒
+    repeat task.wait(.05) until windUILoaded and os.clock() - t0 >= 1.5
+
+    -- 等头像
+    if not avatarReady then
+        local tt = tick()
+        repeat task.wait(.05) until avatarReady or tick() - tt > 5
+    end
+    if avatarImg and avatarImg.Parent then
+        avatarImg.Image = avatarUrl
+    end
+
+    -- 进度条推满
+    fill.Size = UDim2.fromScale(1, 1)
+    foot.Text = 'Starting Agent...'
+    task.wait(0.3)
+
+    -- 退场
+    anim(blur, .5, {Size = 0})
+    for _, l in ipairs({title, sub, foot}) do
+        anim(l, .5, {TextTransparency = 1})
+    end
+    anim(avatarImg, .5, {ImageTransparency = 1})
+    anim(track, .5, {BackgroundTransparency = 1})
+    anim(fill, .5, {BackgroundTransparency = 1})
+    task.wait(.5)
+    if progressConn and progressConn.Connected then
+        progressConn:Disconnect()
+    end
+    sg:Destroy()
+    blur:Destroy()
+end
+
+if not WindUI then
+    warn('[Agent] WindUI 未加载，脚本退出')
+    return
+end
+
+-- ========== 工具 ==========
+local function sanitized(v, limit)
+    local s = tostring(v or ''):gsub('[%z\1-\8\11\12\14-\31]', '')
+    limit = limit or 2000
+    return #s > limit and (s:sub(1, limit) .. '...[truncated]') or s
+end
+
+local TOOLS = {}
+
+TOOLS.run_code = function(a)
+    local compiler = loadstring or load
+    if type(compiler) ~= 'function' then return 'No Luau compiler' end
+    local f, e = compiler(a.code or '', '=agent')
+    if not f then return 'Compile error: ' .. tostring(e) end
+    local captured = {}
+    local function cap(...)
+        local t = table.pack(...)
+        for i = 1, t.n do t[i] = tostring(t[i]) end
+        table.insert(captured, table.concat(t, ' '))
+    end
+    pcall(function()
+        local base = getfenv(f)
+        setfenv(f, setmetatable({print = cap, warn = cap}, {__index = base, __newindex = base}))
+    end)
+    local r = table.pack(xpcall(f, debug.traceback))
+    local text = table.concat(captured, '\n')
+    if r[1] then
+        local rets = {}
+        for i = 2, r.n do
+            table.insert(rets, tostring(r[i]))
+        end
+        local ret = table.concat(rets, ', ')
+        return sanitized(
+            'Success' .. (text ~= '' and ('\nOutput:\n' .. text) or '')
+            .. (ret ~= '' and ('\nReturned: ' .. ret) or ''),
+            5000
+        )
+    end
+    return sanitized('Error: ' .. tostring(r[2]) .. (text ~= '' and ('\nOutput:\n' .. text) or ''), 5000)
+end
+
+TOOLS.read_file = function(a)
+    if type(readfile) ~= 'function' then return 'readfile unavailable' end
+    local ok, v = pcall(readfile, a.path or '')
+    return ok and sanitized(v, 5000) or ('Error: ' .. tostring(v))
+end
+
+TOOLS.write_file = function(a)
+    if type(writefile) ~= 'function' then return 'writefile unavailable' end
+    local ok, e = pcall(writefile, a.path or '', a.content or '')
+    return ok and 'File written' or ('Error: ' .. tostring(e))
+end
+
+TOOLS.list_dir = function(a)
+    if type(listfiles) ~= 'function' then return 'listfiles unavailable' end
+    local ok, v = pcall(listfiles, a.path or '.')
+    return ok and sanitized(table.concat(v, '\n'), 5000) or ('Error: ' .. tostring(v))
+end
+
+TOOLS.search_file = function(a)
+    if type(listfiles) ~= 'function' then return 'listfiles unavailable' end
+    local ok, v = pcall(listfiles, a.root or '.')
+    if not ok then return 'Search failed' end
+    local out = {}
+    local kw = tostring(a.keyword or ''):lower()
+    for _, p in ipairs(v) do
+        if p:lower():find(kw, 1, true) then
+            table.insert(out, p)
+        end
+        if #out >= 30 then break end
+    end
+    return sanitized(table.concat(out, '\n'), 5000)
+end
+
+-- ========== 完整 Agent 提示词（工具调用格式完整版） ==========
+local SYSTEM_PROMPT = [[
+你是 Roblox Luau Agent，运行在执行器环境中。你的唯一目标是：用最少的步骤，把用户交代的事做完。
+
+【决策原则】
+1. 用户说一句话，你自己判断要做什么，不要反问，不要确认。
+2. 能在一次工具调用里做完的，绝不拆成两次。
+3. 报错了，看懂错误信息再改，不要重复提交同样的代码。
+4. 任务完成后，用一句中文总结，不要啰嗦。
+5. 不要输出思考过程，直接调工具或给结果。
+
+【工具清单】
+▶ run_code
+  执行 Luau 代码。改速度、建 UI、传送、加功能，全用它。
+  参数: {"code": "完整可执行 Luau"}
+
+▶ read_file
+  读取本地文件。
+  参数: {"path": "文件路径"}
+
+▶ write_file
+  写入本地文件。
+  参数: {"path": "文件路径", "content": "内容"}
+
+▶ search_file
+  搜索本地文件。
+  参数: {"keyword": "关键词", "root": "搜索根目录，默认 ."}
+
+▶ list_dir
+  列出目录内容。
+  参数: {"path": "目录路径"}
+
+【调用格式 — 必须严格遵守】
+TOOL: 工具名
+ARGS: {"参数": "值"}
+END
+
+不要加 markdown 代码块，不要在 TOOL 前面加空格，不要改大小写。
+
+正确示例：
+TOOL: run_code
+ARGS: {"code": "game.Players.LocalPlayer.Character.Humanoid.WalkSpeed = 100"}
+END
+
+【代码规则】
+1. code 里是完整可执行 Luau，不要 ```lua 标记，不要注释。
+2. 操作角色前先检查 Character 和 Humanoid 是否存在：
+   local char = game.Players.LocalPlayer.Character
+   if char then
+       local hum = char:FindFirstChildOfClass("Humanoid")
+       if hum then hum.WalkSpeed = 100 end
+   end
+3. 建 UI 用 Instance.new，最后 Parent 挂到 PlayerGui。
+4. 事件/循环留退出条件，不要死循环。
+5. 需要防抖的加 debounce。
+6. 用局部变量，不污染全局。
+
+【特殊任务 — 提取代码】
+如果用户说"提取脚本"、"给我代码"、"变成脚本供我复制"，
+不要调 run_code，直接用这个格式输出：
+
+START
+<完整 Luau 代码>
+END
+
+用户会在 UI 里点"复制"按钮复制走。
+
+【禁止事项】
+✗ 不要问用户"你要什么颜色/大小/位置"，自己决定合理默认值
+✗ 不要输出 START/END（除非用户要提取代码）
+✗ 不要用 markdown 代码块
+✗ 不要在 code 里写 print 调试
+✗ 不要解释你正在做什么，直接做
+]]
+
+local function parseTool(s)
+    local name = s:match('[Tt][Oo][Oo][Ll]:%s*([%w_]+)')
+    local json = s:match('[Aa][Rr][Gg][Ss]:%s*(%b{})')
+    if not name or not json then return nil end
+    local ok, a = pcall(HttpService.JSONDecode, HttpService, json)
+    if ok and type(a) == 'table' then return name, a end
+end
+
+local function callAPI(messages)
+    local req = request or http_request or (syn and syn.request)
+    local payload = HttpService:JSONEncode({model = cfg.model, messages = messages, temperature = .3})
+    local args = {
+        Url = 'https://api.deepseek.com/chat/completions',
+        Method = 'POST',
+        Headers = {
+            ['Content-Type'] = 'application/json',
+            ['Authorization'] = 'Bearer ' .. cfg.apiKey
+        },
+        Body = payload
+    }
+    local ok, res = pcall(function()
+        return req and req(args) or HttpService:RequestAsync(args)
+    end)
+    if not ok then return nil, tostring(res) end
+    if (res.StatusCode or 0) ~= 200 then
+        return nil, 'HTTP ' .. tostring(res.StatusCode) .. ': ' .. sanitized(res.Body, 300)
+    end
+    local decodedOk, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+    if not decodedOk or not data.choices or not data.choices[1] then
+        return nil, 'Invalid API response'
+    end
+    return data.choices[1].message.content or ''
+end
+
+-- ========== 主窗口 ==========
+local Window = WindUI:CreateWindow({
+    Title = player.Name,
+    Icon = (avatarUrl ~= '' and avatarUrl or 'user'),
+    Author = 'Agent',
+    Folder = 'AgentWindUI',
+    Size = UDim2.fromOffset(600, 480),
+    MinSize = Vector2.new(480, 360),
+    Theme = cfg.theme,
+    Transparent = true,
+    Resizable = true,
+    SideBarWidth = 175,
+    ToggleKey = Enum.KeyCode.RightShift,
+    HideSearchBar = true
+})
+
+-- 左下角玩家身份卡片
+local badgeFrame = Instance.new('Frame')
+badgeFrame.Name = 'PlayerIdentity'
+badgeFrame.AnchorPoint = Vector2.new(0, 1)
+badgeFrame.Position = UDim2.new(0, 12, 1, -12)
+badgeFrame.Size = UDim2.fromOffset(190, 48)
+badgeFrame.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+badgeFrame.BackgroundTransparency = .08
+badgeFrame.BorderSizePixel = 0
+badgeFrame.ZIndex = 50
+badgeFrame.Parent = Window.UIElements.Main
+Instance.new('UICorner', badgeFrame).CornerRadius = UDim.new(0, 10)
+
+local badgeAvatar = Instance.new('ImageLabel')
+badgeAvatar.Position = UDim2.fromOffset(7, 7)
+badgeAvatar.Size = UDim2.fromOffset(34, 34)
+badgeAvatar.BackgroundTransparency = 1
+badgeAvatar.Image = ''
+badgeAvatar.ZIndex = 51
+badgeAvatar.Parent = badgeFrame
+Instance.new('UICorner', badgeAvatar).CornerRadius = UDim.new(1, 0)
+
+task.spawn(function()
+    local tt = tick()
+    while not avatarReady and tick() - tt < 5 do
+        task.wait(0.05)
+    end
+    if badgeAvatar and badgeAvatar.Parent then
+        badgeAvatar.Image = avatarUrl
+    end
+end)
+
+local badgeName = Instance.new('TextLabel')
+badgeName.Position = UDim2.fromOffset(50, 0)
+badgeName.Size = UDim2.new(1, -58, 1, 0)
+badgeName.BackgroundTransparency = 1
+badgeName.Font = Enum.Font.GothamSemibold
+badgeName.TextSize = 13
+badgeName.TextColor3 = Color3.fromRGB(240, 242, 250)
+badgeName.TextXAlignment = Enum.TextXAlignment.Left
+badgeName.Text = player.Name
+badgeName.ZIndex = 51
+badgeName.Parent = badgeFrame
+
+-- ========== Tab ==========
+local AgentTab = Window:Tab({Title = tr('agent'), Icon = 'bot'})
+local SettingsTab = Window:Tab({Title = tr('settings'), Icon = 'settings'})
+local ConnectionTab = Window:Tab({Title = 'API / Agent', Icon = 'plug'})
+
+local welcome = ConnectionTab:Paragraph({Title = tr('welcome'), Desc = tr('welcomeDesc')})
+local apiKeyInput = ConnectionTab:Input({
+    Title = tr('apiKey'),
+    Desc = 'DeepSeek API Key (sk-...)',
+    Type = 'Input',
+    Placeholder = 'sk-...',
+    Value = cfg.apiKey,
+    Callback = function(v) cfg.apiKey = tostring(v):gsub('%s', '') end
+})
+local model = ConnectionTab:Dropdown({
+    Title = tr('model'),
+    Values = {'deepseek-chat', 'deepseek-reasoner'},
+    Value = cfg.model,
+    Callback = function(v) cfg.model = v end
+})
+local autoExecToggle = ConnectionTab:Toggle({
+    Title = tr('autoExec'),
+    Desc = 'Off = show Execute / Reject buttons',
+    Value = cfg.autoExecute,
+    Callback = function(v) cfg.autoExecute = v end
+})
+
+-- ========== 聊天区 ==========
+local tabContent = AgentTab.UIElements and AgentTab.UIElements.ContainerFrame
+assert(typeof(tabContent) == 'Instance', 'WindUI tab container unavailable')
+
+local chatBox = Instance.new('Frame')
+chatBox.Name = 'AgentChatHistory'
+chatBox.Size = UDim2.new(1, 0, 0, 235)
+chatBox.LayoutOrder = -100
+chatBox.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
+chatBox.BorderSizePixel = 0
+chatBox.ClipsDescendants = true
+chatBox.Parent = tabContent
+Instance.new('UICorner', chatBox).CornerRadius = UDim.new(0, 10)
+
+local heading = Instance.new('TextLabel')
+heading.Size = UDim2.new(1, -24, 0, 30)
+heading.Position = UDim2.fromOffset(12, 0)
+heading.BackgroundTransparency = 1
+heading.Font = Enum.Font.GothamBold
+heading.TextSize = 13
+heading.TextColor3 = Color3.new(1, 1, 1)
+heading.TextXAlignment = Enum.TextXAlignment.Left
+heading.Text = tr('chat')
+heading.Parent = chatBox
+
+local scroll = Instance.new('ScrollingFrame')
+scroll.Name = 'Messages'
+scroll.Position = UDim2.fromOffset(8, 32)
+scroll.Size = UDim2.new(1, -16, 1, -58)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 4
+scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.CanvasSize = UDim2.new()
+scroll.ClipsDescendants = true
+scroll.Active = true
+scroll.Parent = chatBox
+
+local layout = Instance.new('UIListLayout')
+layout.Padding = UDim.new(0, 8)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = scroll
+
+local statusLabel = heading:Clone()
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.TextSize = 10
+statusLabel.Position = UDim2.new(0, 12, 1, -24)
+statusLabel.Size = UDim2.new(1, -24, 0, 22)
+statusLabel.Text = tr('empty')
+statusLabel.Parent = chatBox
+
+local chatLog = {
+    SetTitle = function(_, v) heading.Text = v end,
+    SetDesc = function(_, v) statusLabel.Text = v end
+}
+
+local draft = ''
+local messageInput = AgentTab:Input({
+    Title = tr('message'),
+    Type = 'Textarea',
+    Placeholder = 'Ask Agent...',
+    Callback = function(v) draft = tostring(v or '') end
+})
+
+local conv = {{role = 'system', content = SYSTEM_PROMPT}}
+local running = false
+local session = 0
+local cards = {}
+local pending
+local pump
+
+local function setChat(text)
+    local value = tostring(text or '')
+    local ok = pcall(function() chatLog:SetDesc(value) end)
+    if not ok then safe(chatLog, 'SetDesc', value) end
+end
+local function status(s) setChat(s) end
+
+local function card(title, text, buttons)
+    local nearBottom = scroll.CanvasPosition.Y >= math.max(0, scroll.AbsoluteCanvasSize.Y - scroll.AbsoluteWindowSize.Y - 35)
+    local row = Instance.new('Frame')
+    row.BackgroundTransparency = 1
+    row.Size = UDim2.new(1, -8, 0, 0)
+    row.AutomaticSize = Enum.AutomaticSize.Y
+    row.LayoutOrder = #cards + 1
+    row.Parent = scroll
+
+    local rows = Instance.new('UIListLayout')
+    rows.Padding = UDim.new(0, 4)
+    rows.Parent = row
+
+    local body = Instance.new('TextLabel')
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.BackgroundTransparency = 1
+    body.TextWrapped = true
+    body.RichText = false
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 12
+    body.TextColor3 = Color3.fromRGB(225, 228, 240)
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Top
+    body.Text = ('[' .. title .. ']\n' .. tostring(text))
+    body.Parent = row
+
+    for _, action in ipairs(buttons or {}) do
+        local button = Instance.new('TextButton')
+        button.Size = UDim2.new(1, 0, 0, 26)
+        button.BackgroundColor3 = Color3.fromRGB(43, 49, 66)
+        button.BorderSizePixel = 0
+        button.Font = Enum.Font.Gotham
+        button.TextSize = 12
+        button.TextColor3 = Color3.new(1, 1, 1)
+        button.Text = action.Title
+        button.Parent = row
+        button.Activated:Connect(action.Callback)
+    end
+
+    table.insert(cards, row)
+    if nearBottom then
+        task.defer(function()
+            task.wait()
+            if scroll.Parent then
+                scroll.CanvasPosition = Vector2.new(0, math.max(0, scroll.AbsoluteCanvasSize.Y - scroll.AbsoluteWindowSize.Y))
+            end
+        end)
+    end
+end
+
+local function codeCard(code, token)
+    local function execute()
+        if token ~= session then return end
+        task.spawn(function()
+            local result = TOOLS.run_code({code = code})
+            if token == session then card('Execution', result) end
+        end)
+    end
+
+    card('Luau', code, {
+        {Title = 'Copy', Icon = 'copy', Callback = function()
+            local fn = setclipboard or toclipboard
+            if type(fn) == 'function' then
+                local ok, e = pcall(fn, code)
+                notify(WindUI, ok and 'Copied' or tostring(e))
+            else
+                notify(WindUI, 'Clipboard unavailable')
+            end
+        end},
+        {Title = 'Execute', Icon = 'play', Callback = execute}
+    })
+    if cfg.autoExecute then execute() end
+end
+
+local function finish(token, s)
+    if token == session then
+        running = false
+        status(s or 'Ready')
+    end
+end
+
+local function toolResult(name, args, token)
+    if token ~= session then return false end
+    local ok, res = pcall(TOOLS[name], args)
+    res = ok and tostring(res) or ('Tool error: ' .. tostring(res))
+    if token ~= session then return false end
+    card('Tool / ' .. name, res)
+    table.insert(conv, {role = 'user', content = 'Tool result (' .. name .. '): ' .. sanitized(res, 5000)})
+    return true
+end
+
+pump = function(token, step)
+    local ok, err = xpcall(function()
+        for i = step, 15 do
+            if token ~= session then return end
+            status(cfg.thinking and 'Thinking...' or 'Working...')
+            local snapshot = {}
+            for _, m in ipairs(conv) do
+                table.insert(snapshot, {role = m.role, content = m.content})
+            end
+            local reply, e = callAPI(snapshot)
+            if token ~= session then return end
+            if e then card('Error', e); finish(token, 'Failed'); return end
+            if type(reply) ~= 'string' or reply == '' then
+                card('Error', 'Empty reply')
+                finish(token)
+                return
+            end
+            table.insert(conv, {role = 'assistant', content = reply})
+            local name, args = parseTool(reply)
+            if name then
+                if not TOOLS[name] then
+                    card('Error', 'Unknown tool: ' .. name)
+                    finish(token)
+                    return
+                end
+                if cfg.autoExecute then
+                    card('Tool request / ' .. name, HttpService:JSONEncode(args))
+                    if not toolResult(name, args, token) then return end
+                else
+                    local item = {}
+                    pending = item
+                    status('Awaiting tool action')
+                    card('Tool request / ' .. name, HttpService:JSONEncode(args), {
+                        {Title = 'Execute', Icon = 'play', Callback = function()
+                            if pending ~= item or token ~= session then return end
+                            pending = nil
+                            task.spawn(function()
+                                if toolResult(name, args, token) then pump(token, i + 1) end
+                            end)
+                        end},
+                        {Title = 'Reject', Icon = 'x', Callback = function()
+                            if pending ~= item or token ~= session then return end
+                            pending = nil
+                            table.insert(conv, {role = 'user', content = 'Tool rejected. Do not retry.'})
+                            task.spawn(function() pump(token, i + 1) end)
+                        end}
+                    })
+                    return
+                end
+            else
+                local code = reply:match('^%s*START%s*\r?\n(.-)\r?\n%s*END%s*$')
+                if code then
+                    codeCard(code, token)
+                else
+                    local fence = string.rep(string.char(96), 3)
+                    local pattern = fence .. '([%w_-]*)[ \t]*\r?\n(.-)' .. fence
+                    local prose = reply:gsub(pattern, '')
+                    if prose:match('%S') then card('Agent', prose) end
+                    for lang, body in reply:gmatch(pattern) do
+                        lang = lang:lower()
+                        if lang == '' or lang == 'lua' or lang == 'luau' then
+                            codeCard(body, token)
+                        else
+                            card('Code / ' .. lang, body)
+                        end
+                    end
+                end
+                finish(token)
+                return
+            end
+        end
+        card('Agent', 'Tool limit reached (15).')
+        finish(token)
+    end, function(e) return tostring(e) end)
+    if not ok and token == session then
+        card('Error', err)
+        finish(token, 'Failed')
+    end
+end
+
+local sendButton = AgentTab:Button({
+    Title = tr('send'),
+    Icon = 'send',
+    Callback = function()
+        if running then return notify(WindUI, 'Agent is busy') end
+        if cfg.apiKey == '' then return notify(WindUI, tr('needKey')) end
+        local q = draft
+        if q:match('^%s*$') then return end
+        draft = ''
+        safe(messageInput, 'Set', '')
+        card('You', q)
+        table.insert(conv, {role = 'user', content = q})
+        running = true
+        local token = session
+        task.spawn(function() pump(token, 1) end)
+    end
+})
+
+AgentTab:Button({
+    Title = 'Stop',
+    Icon = 'square',
+    Callback = function()
+        session += 1
+        pending = nil
+        running = false
+        status('Stopped')
+    end
+})
+
+local newChatButton = AgentTab:Button({
+    Title = tr('newChat'),
+    Icon = 'plus',
+    Callback = function()
+        session += 1
+        pending = nil
+        running = false
+        conv = {{role = 'system', content = SYSTEM_PROMPT}}
+        for _, c in ipairs(cards) do c:Destroy() end
+        cards = {}
+        draft = ''
+        safe(messageInput, 'Set', '')
+        status(tr('empty'))
+    end
+})
+
+-- ========== 设置页 ==========
+local appearance = SettingsTab:Paragraph({Title = tr('appearance'), Desc = 'WindUI · Premium Customization'})
+local languageNames = {['简体中文'] = 'zh', ['日本語'] = 'ja', ['English'] = 'en'}
+local languageDisplay = {zh = '简体中文', ja = '日本語', en = 'English'}
+local langDropdown, themeDropdown, transSlider, acrylicToggle, animationToggle, thinkingToggle, saveButton, loadButton, resetButton
+
+local function refreshLanguage()
+    local changes = {
+        {AgentTab, 'agent'}, {SettingsTab, 'settings'}, {welcome, 'welcome'},
+        {apiKeyInput, 'apiKey'}, {model, 'model'}, {autoExecToggle, 'autoExec'},
+        {chatLog, 'chat'}, {messageInput, 'message'}, {sendButton, 'send'},
+        {newChatButton, 'newChat'}, {appearance, 'appearance'},
+        {langDropdown, 'language'}, {themeDropdown, 'theme'},
+        {transSlider, 'transparency'}, {acrylicToggle, 'acrylic'},
+        {animationToggle, 'animations'}, {thinkingToggle, 'thinking'},
+        {saveButton, 'save'}, {loadButton, 'load'}, {resetButton, 'reset'}
+    }
+    for _, p in ipairs(changes) do safe(p[1], 'SetTitle', tr(p[2])) end
+    safe(welcome, 'SetDesc', tr('welcomeDesc'))
+end
+
+langDropdown = SettingsTab:Dropdown({
+    Title = tr('language'),
+    Values = {'简体中文', '日本語', 'English'},
+    Value = languageDisplay[cfg.language] or '简体中文',
+    Callback = function(v)
+        cfg.language = languageNames[v] or 'en'
+        task.defer(refreshLanguage)
+    end
+})
+
+local themes = {}
+local okThemes, available = pcall(function() return WindUI:GetThemes() end)
+if okThemes and type(available) == 'table' then
+    for name in pairs(available) do table.insert(themes, name) end
+end
+if #themes == 0 then themes = {'Dark', 'Light'} end
+table.sort(themes)
+
+themeDropdown = SettingsTab:Dropdown({
+    Title = tr('theme'),
+    Values = themes,
+    Value = cfg.theme,
+    Callback = function(v) cfg.theme = v; safe(WindUI, 'SetTheme', v) end
+})
+
+transSlider = SettingsTab:Slider({
+    Title = tr('transparency'),
+    Step = .05,
+    Value = {Min = 0, Max = 1, Default = cfg.transparency},
+    Callback = function(v) cfg.transparency = v; safe(Window, 'SetBackgroundTransparency', v) end
+})
+
+acrylicToggle = SettingsTab:Toggle({
+    Title = tr('acrylic'),
+    Value = cfg.acrylic,
+    Callback = function(v) cfg.acrylic = v; safe(WindUI, 'ToggleAcrylic', v) end
+})
+
+animationToggle = SettingsTab:Toggle({
+    Title = tr('animations'),
+    Value = cfg.animations,
+    Callback = function(v) cfg.animations = v end
+})
+
+thinkingToggle = SettingsTab:Toggle({
+    Title = tr('thinking'),
+    Value = cfg.thinking,
+    Callback = function(v) cfg.thinking = v end
+})
+
+local function applyConfig()
+    safe(WindUI, 'SetTheme', cfg.theme)
+    safe(Window, 'SetBackgroundTransparency', cfg.transparency)
+    safe(WindUI, 'ToggleAcrylic', cfg.acrylic)
+    safe(apiKeyInput, 'Set', cfg.apiKey)
+    safe(model, 'Select', cfg.model)
+    safe(autoExecToggle, 'Set', cfg.autoExecute)
+    safe(langDropdown, 'Select', languageDisplay[cfg.language] or 'English')
+    safe(themeDropdown, 'Select', cfg.theme)
+    safe(transSlider, 'Set', cfg.transparency)
+    safe(acrylicToggle, 'Set', cfg.acrylic)
+    safe(animationToggle, 'Set', cfg.animations)
+    safe(thinkingToggle, 'Set', cfg.thinking)
+    refreshLanguage()
+end
+
+saveButton = SettingsTab:Button({
+    Title = tr('save'), Icon = 'save',
+    Callback = function() notify(WindUI, saveConfig() and 'Saved' or 'Save failed') end
+})
+loadButton = SettingsTab:Button({
+    Title = tr('load'), Icon = 'folder-open',
+    Callback = function() notify(WindUI, loadConfig() and 'Loaded' or 'Load failed'); applyConfig() end
+})
+resetButton = SettingsTab:Button({
+    Title = tr('reset'), Icon = 'rotate-ccw',
+    Callback = function()
+        for k, v in pairs(defaults) do cfg[k] = v end
+        applyConfig()
+        notify(WindUI, 'Restored defaults')
+    end
+})
+
+applyConfig()
+AgentTab:Select()
+notify(WindUI, 'Agent loaded')
